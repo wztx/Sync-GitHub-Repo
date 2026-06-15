@@ -1,0 +1,348 @@
+name: 同步指定上游仓库
+
+# 详细使用说明请查看 README.md
+
+on:
+  schedule:
+    # 每6小时在整点后5分进行一次 (UTC 0:00)
+    - cron: "5 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Parse sync configuration
+        id: set-matrix
+        env:
+          SYNC_REPOS: ${{ vars.SYNC_REPOS }}
+        run: |
+          if [ -z "$SYNC_REPOS" ]; then
+            echo "❌ 错误：请在仓库 Settings → Secrets and variables → Actions → Variables 中配置 SYNC_REPOS"
+            echo "格式示例："
+            echo '[{"upstream": "https://github.com/owner/repo.git", "target": "myuser/repo", "branch": "main", "token": "TOKEN_NAME"}]'
+            exit 1
+          fi
+          
+          if ! echo "$SYNC_REPOS" | jq empty 2>/dev/null; then
+            echo "❌ 错误：SYNC_REPOS 的 JSON 格式不正确"
+            echo "请检查 JSON 语法（引号、逗号、括号是否正确）"
+            exit 1
+          fi
+          
+          if [ "$(echo "$SYNC_REPOS" | jq 'type')" != '"array"' ]; then
+            echo "❌ 错误：SYNC_REPOS 必须是 JSON 数组格式"
+            exit 1
+          fi
+          
+          REPO_COUNT=$(echo "$SYNC_REPOS" | jq length)
+          if [ "$REPO_COUNT" -eq 0 ]; then
+            echo "❌ 错误：SYNC_REPOS 数组为空，没有配置任何同步任务"
+            exit 1
+          fi
+          
+          MATRIX_JSON=$(echo "$SYNC_REPOS" | jq -c .)
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "📋 已加载 $REPO_COUNT 个同步任务"
+
+  sync:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    
+    steps:
+      - name: Sync ${{ matrix.repo.target }}
+        id: sync
+        env:
+          UPSTREAM_REPO: ${{ matrix.repo.upstream }}
+          TARGET_REPO: ${{ matrix.repo.target }}
+          SYNC_BRANCH: ${{ matrix.repo.branch }}
+          REPO_TOKEN: ${{ secrets[matrix.repo.token] }}
+        run: |
+          echo "========================================" 
+          echo "📋 同步配置："
+          echo "   上游仓库: $UPSTREAM_REPO"
+          echo "   目标仓库: $TARGET_REPO"
+          echo "   同步分支: $SYNC_BRANCH"
+          echo "========================================"
+          
+          SYNC_STATUS="unknown"
+          
+          TARGET_URL="https://x-access-token:${REPO_TOKEN}@github.com/${TARGET_REPO}.git"
+          
+          if [ -z "$REPO_TOKEN" ]; then
+            echo "❌ [$TARGET_REPO] 错误：Token 未配置或名称错误"
+            echo "   请检查 Secrets 中是否存在对应的 Token"
+            SYNC_STATUS="error"
+            echo "status=$SYNC_STATUS" >> $GITHUB_OUTPUT
+            echo "repo=$TARGET_REPO" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          UPSTREAM_SHA=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$SYNC_BRANCH" | cut -f1)
+          
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "❌ [$TARGET_REPO] 错误：上游仓库的 $SYNC_BRANCH 分支不存在"
+            echo "   请检查上游仓库地址和分支名称是否正确"
+            SYNC_STATUS="error"
+            echo "status=$SYNC_STATUS" >> $GITHUB_OUTPUT
+            echo "repo=$TARGET_REPO" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "上游 $SYNC_BRANCH 分支最新 commit: $UPSTREAM_SHA"
+          
+          TARGET_SHA=$(git ls-remote "$TARGET_URL" "refs/heads/$SYNC_BRANCH" 2>/dev/null | cut -f1 || echo "")
+          echo "目标仓库 $SYNC_BRANCH 分支当前 commit: ${TARGET_SHA:-'(分支不存在)'}"
+          
+          if [ "$UPSTREAM_SHA" = "$TARGET_SHA" ]; then
+            echo "✅ [$TARGET_REPO] 已是最新，无需同步"
+            SYNC_STATUS="skipped"
+          else
+            echo "🔄 [$TARGET_REPO] 检测到更新，开始同步..."
+            
+            git clone --bare "$UPSTREAM_REPO" upstream-repo
+            cd upstream-repo
+            
+            if git push --mirror --force "$TARGET_URL"; then
+              echo "✅ [$TARGET_REPO] 同步完成！"
+              SYNC_STATUS="synced"
+            else
+              echo "❌ [$TARGET_REPO] 同步失败！"
+              SYNC_STATUS="failed"
+            fi
+          fi
+          
+          echo "status=$SYNC_STATUS" >> $GITHUB_OUTPUT
+          echo "repo=$TARGET_REPO" >> $GITHUB_OUTPUT
+
+      
+      - name: Save sync result
+        if: always()
+        run: |
+          mkdir -p sync-results
+          echo "${{ matrix.repo.target }}|${{ steps.sync.outputs.status || 'failed' }}" > sync-results/result-${{ strategy.job-index }}.txt
+      
+      - name: Upload sync result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-result-${{ strategy.job-index }}
+          path: sync-results/
+          retention-days: 1
+
+  collect:
+    needs: sync
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      summary: ${{ steps.collect.outputs.summary }}
+      synced_count: ${{ steps.collect.outputs.synced_count }}
+      skipped_count: ${{ steps.collect.outputs.skipped_count }}
+      failed_count: ${{ steps.collect.outputs.failed_count }}
+    steps:
+      - name: Download all sync results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sync-result-*
+          merge-multiple: true
+          path: sync-results/
+      
+      - name: Collect results
+        id: collect
+        run: |
+          SYNCED=""
+          SKIPPED=""
+          FAILED=""
+          SYNCED_COUNT=0
+          SKIPPED_COUNT=0
+          FAILED_COUNT=0
+          
+          if [ -d "sync-results" ]; then
+            for file in sync-results/*.txt; do
+              if [ -f "$file" ]; then
+                while IFS='|' read -r repo status; do
+                  case "$status" in
+                    synced)  
+                      SYNCED="$SYNCED\n✅ $repo"
+                      SYNCED_COUNT=$((SYNCED_COUNT + 1))
+                      ;;
+                    skipped) 
+                      SKIPPED="$SKIPPED\n⏭️ $repo (已是最新)"
+                      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                      ;;
+                    *)       
+                      FAILED="$FAILED\n❌ $repo"
+                      FAILED_COUNT=$((FAILED_COUNT + 1))
+                      ;;
+                  esac
+                done < "$file"
+              fi
+            done
+          fi
+          
+          SUMMARY=""
+          if [ -n "$SYNCED" ]; then
+            SUMMARY="${SUMMARY}【已同步】${SYNCED}\n\n"
+          fi
+          if [ -n "$SKIPPED" ]; then
+            SUMMARY="${SUMMARY}【已跳过】${SKIPPED}\n\n"
+          fi
+          if [ -n "$FAILED" ]; then
+            SUMMARY="${SUMMARY}【失败】${FAILED}\n\n"
+          fi
+          
+          if [ -z "$SUMMARY" ]; then
+            SUMMARY="没有同步任务执行"
+          fi
+          
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "synced_count=$SYNCED_COUNT" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+          echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+
+  notify:
+    needs: [sync, collect]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send notifications
+        env:
+          NOTIFY_CONFIG: ${{ vars.NOTIFY_CONFIG }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SYNC_SUMMARY: ${{ needs.collect.outputs.summary }}
+          SYNCED_COUNT: ${{ needs.collect.outputs.synced_count }}
+          SKIPPED_COUNT: ${{ needs.collect.outputs.skipped_count }}
+          FAILED_COUNT: ${{ needs.collect.outputs.failed_count }}
+          REPO_NAME: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$NOTIFY_CONFIG" ]; then
+            echo "ℹ️ 未配置 NOTIFY_CONFIG，跳过通知"
+            exit 0
+          fi
+          
+          if ! echo "$NOTIFY_CONFIG" | jq empty 2>/dev/null; then
+            echo "⚠️ NOTIFY_CONFIG JSON 格式不正确，跳过通知"
+            echo "请检查 JSON 语法是否正确"
+            exit 0
+          fi
+          
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          SYNCED_COUNT=${SYNCED_COUNT:-0}
+          SKIPPED_COUNT=${SKIPPED_COUNT:-0}
+          FAILED_COUNT=${FAILED_COUNT:-0}
+          
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            STATUS="❌ 有 ${FAILED_COUNT} 个失败"
+            TITLE="GitHub 仓库同步失败"
+          elif [ "$SYNCED_COUNT" -gt 0 ]; then
+            STATUS="✅ 同步了 ${SYNCED_COUNT} 个仓库"
+            TITLE="GitHub 仓库同步成功"
+          elif [ "$SKIPPED_COUNT" -gt 0 ]; then
+            STATUS="⏭️ ${SKIPPED_COUNT} 个仓库已是最新"
+            TITLE="GitHub 仓库无需同步"
+          else
+            STATUS="ℹ️ 无任务执行"
+            TITLE="GitHub 仓库同步检查完成"
+          fi
+          
+          MESSAGE=$(printf "%s\n\n时间: %s\n状态: %s\n仓库: %s\n运行: %s\n\n%s" \
+            "$TITLE" "$TIMESTAMP" "$STATUS" "$REPO_NAME" "$RUN_URL" "$SYNC_SUMMARY")
+          
+          # JSON 转义的消息（用于 Discord、钉钉、企业微信）
+          MESSAGE_ESCAPED=$(echo "$MESSAGE" | jq -Rs .)
+          
+          # ========== Telegram ==========
+          if echo "$NOTIFY_CONFIG" | jq -e '.telegram' > /dev/null 2>&1; then
+            CHAT_ID=$(echo "$NOTIFY_CONFIG" | jq -r '.telegram.chat_id')
+            if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$CHAT_ID" ] && [ "$CHAT_ID" != "null" ]; then
+              echo "📤 发送 Telegram 通知..."
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${CHAT_ID}" \
+                --data-urlencode "text=${MESSAGE}" || echo "⚠️ Telegram 发送失败"
+            fi
+          fi
+          
+          # ========== Discord ==========
+          if echo "$NOTIFY_CONFIG" | jq -e '.discord' > /dev/null 2>&1; then
+            if [ -n "$DISCORD_WEBHOOK" ]; then
+              echo "📤 发送 Discord 通知..."
+              curl -s -X POST "$DISCORD_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                -d "{\"content\": ${MESSAGE_ESCAPED}}" || echo "⚠️ Discord 发送失败"
+            fi
+          fi
+          
+          # ========== 钉钉 DingTalk ==========
+          if echo "$NOTIFY_CONFIG" | jq -e '.dingtalk' > /dev/null 2>&1; then
+            if [ -n "$DINGTALK_WEBHOOK" ]; then
+              echo "📤 发送钉钉通知..."
+              curl -s -X POST "$DINGTALK_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                -d "{\"msgtype\": \"text\", \"text\": {\"content\": ${MESSAGE_ESCAPED}}}" || echo "⚠️ 钉钉发送失败"
+            fi
+          fi
+          
+          # ========== 企业微信 WeCom ==========
+          if echo "$NOTIFY_CONFIG" | jq -e '.wecom' > /dev/null 2>&1; then
+            if [ -n "$WECOM_WEBHOOK" ]; then
+              echo "📤 发送企业微信通知..."
+              curl -s -X POST "$WECOM_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                -d "{\"msgtype\": \"text\", \"text\": {\"content\": ${MESSAGE_ESCAPED}}}" || echo "⚠️ 企业微信发送失败"
+            fi
+          fi
+          
+          # ========== Server酱 ServerChan ==========
+          if echo "$NOTIFY_CONFIG" | jq -e '.serverchan' > /dev/null 2>&1; then
+            if [ -n "$SERVERCHAN_KEY" ]; then
+              echo "📤 发送 Server酱 通知..."
+              curl -s -X POST "https://sctapi.ftqq.com/${SERVERCHAN_KEY}.send" \
+                --data-urlencode "title=${TITLE}" \
+                --data-urlencode "desp=${MESSAGE}" || echo "⚠️ Server酱发送失败"
+            fi
+          fi
+          
+          # ========== 邮件 Email ==========
+          if echo "$NOTIFY_CONFIG" | jq -e '.email' > /dev/null 2>&1; then
+            EMAIL_TO=$(echo "$NOTIFY_CONFIG" | jq -r '.email.to')
+            EMAIL_FROM=$(echo "$NOTIFY_CONFIG" | jq -r '.email.from // "noreply@github.com"')
+            if [ -n "$SMTP_SERVER" ] && [ -n "$SMTP_USERNAME" ] && [ -n "$SMTP_PASSWORD" ] && [ -n "$EMAIL_TO" ] && [ "$EMAIL_TO" != "null" ]; then
+              echo "📤 发送邮件通知..."
+              # 解析服务器和端口
+              SMTP_HOST=$(echo "$SMTP_SERVER" | cut -d: -f1)
+              SMTP_PORT=$(echo "$SMTP_SERVER" | cut -d: -f2)
+              
+              # 构建邮件内容
+              EMAIL_CONTENT=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=utf-8\n\n%s" \
+                "$EMAIL_FROM" "$EMAIL_TO" "$TITLE" "$MESSAGE")
+              
+              # 使用 curl 发送邮件
+              echo "$EMAIL_CONTENT" | curl -s --ssl-reqd \
+                --url "smtps://${SMTP_HOST}:${SMTP_PORT}" \
+                --user "${SMTP_USERNAME}:${SMTP_PASSWORD}" \
+                --mail-from "${EMAIL_FROM}" \
+                --mail-rcpt "${EMAIL_TO}" \
+                -T - || echo "⚠️ 邮件发送失败"
+            fi
+          fi
+          
+          echo "✅ 通知发送完成"
