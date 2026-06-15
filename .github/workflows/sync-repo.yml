@@ -346,3 +346,11 @@ jobs:
           fi
           
           echo "✅ 通知发送完成"
+          
+      - name: 删除旧的工作流
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0 # 删除前保留工作流运行的天数
+          keep_minimum_runs: 1 # 每个工作流要保持的最小运行次数
