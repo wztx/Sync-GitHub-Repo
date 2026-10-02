@@ -21,9 +21,17 @@ jobs:
     permissions:
       actions: write
       contents: read
+    outputs:
+      days:    ${{ steps.cleanup.outputs.days }}
+      cutoff:  ${{ steps.cleanup.outputs.cutoff }}
+      total:   ${{ steps.cleanup.outputs.total }}
+      deleted: ${{ steps.cleanup.outputs.deleted }}
+      failed:  ${{ steps.cleanup.outputs.failed }}
+      skipped: ${{ steps.cleanup.outputs.skipped }}
 
     steps:
       - name: 删除超过指定天数的工作流运行记录
+        id: cleanup
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -39,23 +47,32 @@ jobs:
 
           CUTOFF=$(date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
           echo "删除 ${CUTOFF} 之前的运行记录"
-          echo ""
+
+          echo "days=${DAYS}"       >> "$GITHUB_OUTPUT"
+          echo "cutoff=${CUTOFF}"   >> "$GITHUB_OUTPUT"
+          echo "skipped=false"      >> "$GITHUB_OUTPUT"
 
           WORKFLOW_ID=$(gh api "repos/${REPO}/actions/workflows" --paginate \
             --jq ".workflows[] | select(.name == \"${WORKFLOW_NAME}\") | .id" | head -1)
 
           if [ -z "${WORKFLOW_ID}" ]; then
             echo "⚠️ 未找到工作流: ${WORKFLOW_NAME}，跳过清理"
+            echo "total=0"   >> "$GITHUB_OUTPUT"
+            echo "deleted=0" >> "$GITHUB_OUTPUT"
+            echo "failed=0"  >> "$GITHUB_OUTPUT"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "工作流 ID: ${WORKFLOW_ID}"
-          echo ""
 
           RUN_IDS=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs" --paginate \
             --jq ".workflow_runs[] | select(.created_at < \"${CUTOFF}\") | .id")
 
           if [ -z "${RUN_IDS}" ]; then
             echo "✅ 没有需要删除的运行记录"
+            echo "total=0"   >> "$GITHUB_OUTPUT"
+            echo "deleted=0" >> "$GITHUB_OUTPUT"
+            echo "failed=0"  >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -63,7 +80,6 @@ jobs:
           FAILED=0
           TOTAL=$(echo "${RUN_IDS}" | wc -l | tr -d ' ')
           echo "共找到 ${TOTAL} 条待删除记录"
-          echo ""
 
           for id in ${RUN_IDS}; do
             if gh api -X DELETE "repos/${REPO}/actions/runs/${id}" 2>/dev/null; then
@@ -75,11 +91,10 @@ jobs:
             fi
           done
 
-          echo ""
-          echo "==============================================="
-          echo "清理完成：成功 ${DELETED} 条 / 失败 ${FAILED} 条 / 总计 ${TOTAL} 条"
-          echo "结束时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          echo "==============================================="
+          echo "total=${TOTAL}"     >> "$GITHUB_OUTPUT"
+          echo "deleted=${DELETED}" >> "$GITHUB_OUTPUT"
+          echo "failed=${FAILED}"   >> "$GITHUB_OUTPUT"
+          echo "清理完成：成功 ${DELETED} / 失败 ${FAILED} / 总计 ${TOTAL}"
 
   # ======================================================
   # 任务二：同步仓库到 CNB.COOL
@@ -95,7 +110,14 @@ jobs:
         repo: ${{ fromJSON(vars.CNB_SYNC_REPOS) }}
 
     steps:
-      # ---------- 0. 初始化日志 ----------
+      # ---------- 0. 记录开始时间 ----------
+      - name: 记录开始时间
+        id: start
+        run: |
+          echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "iso=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      # ---------- 1. 初始化日志 ----------
       - name: 输出任务开始信息
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
@@ -107,13 +129,12 @@ jobs:
             echo "触发事件: ${{ github.event_name }}"
             echo "触发者  : ${{ github.actor }}"
             echo "运行编号: ${{ github.run_number }}"
-            echo "开始时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "开始时间: ${{ steps.start.outputs.iso }}"
             echo "运行环境: $(uname -a)"
             echo "==============================================="
           } | tee "${LOG}"
-          echo "日志文件: ${LOG}" | tee -a "${LOG}"
 
-      # ---------- 1. 诊断：校验所有 Secret 是否已配置 ----------
+      # ---------- 2. 校验 Secret ----------
       - name: 校验 Secret 配置（诊断）
         env:
           GH_PRIVATE_TOKEN: ${{ secrets.GH_PRIVATE_TOKEN }}
@@ -127,19 +148,13 @@ jobs:
           echo "GH_PRIVATE_TOKEN 长度: ${#GH_PRIVATE_TOKEN}" | tee -a "${LOG}"
           echo "CNB_TOKEN        长度: ${#CNB_TOKEN}" | tee -a "${LOG}"
 
-          if [ -z "${GH_PRIVATE_TOKEN}" ]; then
-            echo "" | tee -a "${LOG}"
-            echo "⚠️ 警告: GH_PRIVATE_TOKEN 为空！" | tee -a "${LOG}"
-            echo "   私有仓库同步将失败，请在仓库设置中创建该 Secret。" | tee -a "${LOG}"
-          fi
           if [ -z "${CNB_TOKEN}" ]; then
-            echo "" | tee -a "${LOG}"
             echo "❌ 错误: CNB_TOKEN 为空，无法推送到 CNB。" | tee -a "${LOG}"
             exit 1
           fi
           echo "✅ Secret 检查通过" | tee -a "${LOG}"
 
-      # ---------- 2. 预探测默认 TOKEN 是否有权访问源仓库 ----------
+      # ---------- 3. 探测默认 TOKEN 可访问性 ----------
       - name: 探测默认 TOKEN 可访问性
         id: probe
         continue-on-error: true
@@ -156,7 +171,7 @@ jobs:
             exit 1
           fi
 
-      # ---------- 3. 检出（默认 TOKEN） ----------
+      # ---------- 4. 检出（默认 TOKEN） ----------
       - name: 检出原仓库（默认 GITHUB_TOKEN）
         id: checkout_default
         if: steps.probe.outcome == 'success'
@@ -167,7 +182,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ---------- 4. 检出（私有 TOKEN） ----------
+      # ---------- 5. 检出（私有 TOKEN） ----------
       - name: 检出原仓库（私有仓库 TOKEN）
         id: checkout_private
         if: steps.probe.outcome == 'failure'
@@ -178,7 +193,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ---------- 5. 检查检出结果 ----------
+      # ---------- 6. 检查检出结果 ----------
       - name: 检查检出结果
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
@@ -197,31 +212,36 @@ jobs:
           elif [ "${PRIVATE}" = "success" ]; then
             echo "检出方式 : 私有仓库 TOKEN (GH_PRIVATE_TOKEN)" | tee -a "${LOG}"
           else
-            echo "" | tee -a "${LOG}"
             echo "❌ 两种 Token 均无法访问仓库: ${{ matrix.repo.source }}" | tee -a "${LOG}"
-            echo "" | tee -a "${LOG}"
-            echo "排查建议：" | tee -a "${LOG}"
-            echo "  1. 仓库路径拼写是否正确（大小写敏感）" | tee -a "${LOG}"
-            echo "  2. GITHUB_TOKEN 默认无法跨仓库访问，属正常现象" | tee -a "${LOG}"
-            echo "  3. GH_PRIVATE_TOKEN 是否已创建且非空" | tee -a "${LOG}"
-            echo "  4. Classic PAT: 需勾选 repo 权限" | tee -a "${LOG}"
-            echo "  5. Fine-grained PAT: 需勾选 Contents: Read + Metadata: Read" | tee -a "${LOG}"
-            echo "  6. Fine-grained PAT: 需把该仓库加入可访问列表" | tee -a "${LOG}"
-            echo "  7. 组织是否启用了 SAML SSO，Token 需额外授权" | tee -a "${LOG}"
             exit 1
           fi
 
-      # ---------- 6. 输出仓库统计信息 ----------
+      # ---------- 7. 仓库统计 ----------
       - name: 输出仓库统计信息
+        id: stats
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
-          echo "当前分支 : $(git branch --show-current)" | tee -a "${LOG}"
-          echo "最新提交 : $(git log -1 --oneline)" | tee -a "${LOG}"
-          echo "提交总数 : $(git rev-list --count HEAD)" | tee -a "${LOG}"
-          echo "分支数量 : $(git branch -r | wc -l)" | tee -a "${LOG}"
-          echo "工作区大小: $(du -sh .git | cut -f1)" | tee -a "${LOG}"
+          BRANCH=$(git branch --show-current)
+          LATEST=$(git log -1 --oneline 2>/dev/null || echo "无")
+          COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+          BRANCHES=$(git branch -r 2>/dev/null | wc -l | tr -d ' ')
+          SIZE=$(du -sh .git 2>/dev/null | cut -f1)
 
-      # ---------- 7. 配置 Git 用户 ----------
+          echo "当前分支 : ${BRANCH}" | tee -a "${LOG}"
+          echo "最新提交 : ${LATEST}" | tee -a "${LOG}"
+          echo "提交总数 : ${COMMITS}" | tee -a "${LOG}"
+          echo "分支数量 : ${BRANCHES}" | tee -a "${LOG}"
+          echo "工作区大小: ${SIZE}" | tee -a "${LOG}"
+
+          {
+            echo "branch=${BRANCH}"
+            echo "latest=${LATEST}"
+            echo "commits=${COMMITS}"
+            echo "branches=${BRANCHES}"
+            echo "size=${SIZE}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------- 8. 配置 Git 用户 ----------
       - name: 配置 Git 用户信息
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
@@ -229,8 +249,9 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           echo "Git 用户已配置: github-actions[bot]" | tee -a "${LOG}"
 
-      # ---------- 8. 同步分支到 CNB.COOL ----------
+      # ---------- 9. 同步分支到 CNB.COOL ----------
       - name: 同步分支到 CNB.COOL
+        id: push
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           TARGET_REPO: ${{ matrix.repo.target }}
@@ -243,7 +264,6 @@ jobs:
           echo "目标地址: https://cnb.cool/${TARGET_REPO}.git" | tee -a "${LOG}"
           echo "认证用户: cnb" | tee -a "${LOG}"
 
-          # 构造 GitHub 认证头（checkout 的 persist-credentials: false 不保存凭证）
           GH_AUTH=$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 -w0)
           GH_HEADER="Authorization: basic ${GH_AUTH}"
 
@@ -251,9 +271,9 @@ jobs:
           git -c http.extraheader="${GH_HEADER}" \
             fetch --prune origin "+refs/heads/*:refs/remotes/origin/*" 2>&1 | tee -a "${LOG}"
 
-          # 检查是否有分支可推送
           if [ -z "$(git for-each-ref refs/remotes/origin --format='%(refname)')" ]; then
             echo "⚠️ 无远程分支，跳过推送" | tee -a "${LOG}"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -263,57 +283,215 @@ jobs:
           echo ">> 推送所有分支（--prune 删除多余分支，不推送标签）..." | tee -a "${LOG}"
           if git push cnb --prune --force --no-tags "refs/remotes/origin/*:refs/heads/*" 2>&1 | tee -a "${LOG}"; then
             echo "✅ 分支推送成功" | tee -a "${LOG}"
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
           else
             echo "❌ 分支推送失败" | tee -a "${LOG}"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
           echo "完成时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" | tee -a "${LOG}"
 
-      # ---------- 9. 输出日志到工作流页面 ----------
-      - name: 输出日志至工作流页面
+      # ---------- 10. 写出结果 JSON ----------
+      - name: 写出结果 JSON
         if: always()
+        env:
+          START_TS: ${{ steps.start.outputs.ts }}
+          START_ISO: ${{ steps.start.outputs.iso }}
+          CHECKOUT_DEFAULT: ${{ steps.checkout_default.outcome }}
+          CHECKOUT_PRIVATE: ${{ steps.checkout_private.outcome }}
+          STATS_BRANCH: ${{ steps.stats.outputs.branch }}
+          STATS_LATEST: ${{ steps.stats.outputs.latest }}
+          STATS_COMMITS: ${{ steps.stats.outputs.commits }}
+          STATS_BRANCHES: ${{ steps.stats.outputs.branches }}
+          STATS_SIZE: ${{ steps.stats.outputs.size }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          LOG="${RUNNER_TEMP}/sync.log"
-          {
-            echo ""
-            echo "---"
-            echo ""
-            echo "## 📋 同步日志：\`${{ matrix.repo.source }}\` → \`${{ matrix.repo.target }}\`"
-            echo ""
-            echo "| 项目 | 结果 |"
-            echo "|---|---|"
-            echo "| 默认可访问性探测 | ${{ steps.probe.outcome }} |"
-            echo "| 默认 TOKEN 检出 | ${{ steps.checkout_default.outcome }} |"
-            echo "| 私有 TOKEN 检出 | ${{ steps.checkout_private.outcome }} |"
-            echo "| 作业状态 | ${{ job.status }} |"
-            echo ""
-            echo "<details><summary>展开完整日志</summary>"
-            echo ""
-            echo '```text'
-            if [ -f "${LOG}" ]; then
-              cat "${LOG}"
-            else
-              echo "（无日志记录）"
-            fi
-            echo '```'
-            echo ""
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
+          END_TS=$(date +%s)
+          END_ISO=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          DURATION=$((END_TS - START_TS))
 
-      # ---------- 10. 清理缓存与临时文件 ----------
+          if [ "${CHECKOUT_DEFAULT}" = "success" ]; then
+            AUTH="default"
+          elif [ "${CHECKOUT_PRIVATE}" = "success" ]; then
+            AUTH="private"
+          else
+            AUTH="none"
+          fi
+
+          mkdir -p results
+          jq -n \
+            --arg source     "${{ matrix.repo.source }}" \
+            --arg target     "${{ matrix.repo.target }}" \
+            --arg status     "${JOB_STATUS}" \
+            --arg auth       "${AUTH}" \
+            --arg pushed     "${PUSHED}" \
+            --arg branch     "${STATS_BRANCH:-—}" \
+            --arg latest     "${STATS_LATEST:-—}" \
+            --arg commits    "${STATS_COMMITS:-—}" \
+            --arg branches   "${STATS_BRANCHES:-—}" \
+            --arg size       "${STATS_SIZE:-—}" \
+            --arg start_iso  "${START_ISO}" \
+            --arg end_iso    "${END_ISO}" \
+            --argjson duration "${DURATION}" \
+            '{
+              source: $source,
+              target: $target,
+              status: $status,
+              auth: $auth,
+              pushed: $pushed,
+              branch: $branch,
+              latest: $latest,
+              commits: $commits,
+              branches: $branches,
+              size: $size,
+              start_iso: $start_iso,
+              end_iso: $end_iso,
+              duration: $duration
+            }' > results/result.json
+
+          echo "结果文件:"
+          cat results/result.json
+
+      # ---------- 11. 上传结果 artifact ----------
+      - name: 上传结果 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-result-${{ strategy.job-index }}
+          path: results/result.json
+          retention-days: 1
+          if-no-files-found: warn
+
+      # ---------- 12. 清理 ----------
       - name: 清理缓存和临时文件
         if: always()
         run: |
           echo "----- 开始清理 -----"
           git remote remove cnb 2>/dev/null || true
-          echo "已移除远程 cnb"
           git config --global --unset user.name  2>/dev/null || true
           git config --global --unset user.email 2>/dev/null || true
-          echo "已清理 Git 全局配置"
           rm -f "${RUNNER_TEMP}/sync.log"
           rm -rf "${RUNNER_TEMP:?}"/*  2>/dev/null || true
-          echo "已清理临时目录: ${RUNNER_TEMP}"
           git clean -fdx 2>/dev/null || true
-          echo "已清理工作区"
           echo "✅ 清理完成"
+
+  # ======================================================
+  # 任务三：生成汇总作业摘要
+  # ======================================================
+  summary:
+    name: 生成汇总作业摘要
+    runs-on: ubuntu-latest
+    needs: [cleanup-old-runs, sync-to-cnb]
+    if: always()
+
+    steps:
+      - name: 下载所有结果 artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sync-result-*
+        continue-on-error: true
+
+      - name: 生成汇总摘要
+        env:
+          CLEAN_DAYS:     ${{ needs.cleanup-old-runs.outputs.days }}
+          CLEAN_CUTOFF:   ${{ needs.cleanup-old-runs.outputs.cutoff }}
+          CLEAN_TOTAL:    ${{ needs.cleanup-old-runs.outputs.total }}
+          CLEAN_DELETED:  ${{ needs.cleanup-old-runs.outputs.deleted }}
+          CLEAN_FAILED:   ${{ needs.cleanup-old-runs.outputs.failed }}
+          CLEAN_SKIPPED:  ${{ needs.cleanup-old-runs.outputs.skipped }}
+        run: |
+          TOTAL=0
+          SUCCESS=0
+          FAILED=0
+          TOTAL_DURATION=0
+          ROWS=""
+
+          if [ -d "artifacts" ]; then
+            for f in $(find artifacts -name 'result.json' 2>/dev/null); do
+              TOTAL=$((TOTAL + 1))
+
+              SOURCE=$(jq -r '.source'   "$f")
+              TARGET=$(jq -r '.target'   "$f")
+              STATUS=$(jq -r '.status'   "$f")
+              AUTH=$(jq -r '.auth'       "$f")
+              PUSHED=$(jq -r '.pushed'   "$f")
+              BRANCH=$(jq -r '.branch'   "$f")
+              COMMITS=$(jq -r '.commits' "$f")
+              BRANCHES=$(jq -r '.branches' "$f")
+              SIZE=$(jq -r '.size'       "$f")
+              DURATION=$(jq -r '.duration' "$f")
+
+              if [ "$STATUS" = "success" ]; then
+                STATUS_ICON="✅"
+                SUCCESS=$((SUCCESS + 1))
+              else
+                STATUS_ICON="❌"
+                FAILED=$((FAILED + 1))
+              fi
+
+              case "$AUTH" in
+                default) AUTH_TEXT="🔓 默认" ;;
+                private) AUTH_TEXT="🔐 私有" ;;
+                *)       AUTH_TEXT="❌ 失败" ;;
+              esac
+
+              case "$PUSHED" in
+                true)  PUSH_TEXT="✅" ;;
+                false) PUSH_TEXT="❌" ;;
+                *)     PUSH_TEXT="—" ;;
+              esac
+
+              TOTAL_DURATION=$((TOTAL_DURATION + DURATION))
+
+              ROWS="${ROWS}| ${STATUS_ICON} | \`${SOURCE}\` | \`${TARGET}\` | ${AUTH_TEXT} | ${PUSH_TEXT} | ${BRANCH} | ${COMMITS} | ${BRANCHES} | ${SIZE} | ${DURATION}s |\n"
+            done
+          fi
+
+          MIN=$((TOTAL_DURATION / 60))
+          SEC=$((TOTAL_DURATION % 60))
+
+          if [ "$TOTAL" -eq 0 ]; then
+            HEADER="> ⚠️ **无同步任务或结果获取失败**"
+          elif [ "$FAILED" -eq 0 ]; then
+            HEADER="> ✅ **全部成功** ｜ 共 **${TOTAL}** 个仓库 ｜ 累计耗时 **${MIN} 分 ${SEC} 秒**"
+          else
+            HEADER="> ⚠️ **部分失败** ｜ ✅ ${SUCCESS} 成功 / ❌ ${FAILED} 失败 ｜ 共 **${TOTAL}** 个仓库 ｜ 累计耗时 **${MIN} 分 ${SEC} 秒**"
+          fi
+
+          {
+            echo "# 🔄 GitHub → CNB.COOL 同步汇总"
+            echo ""
+            echo "${HEADER}"
+            echo ""
+            echo "**运行信息**：编号 \`#${{ github.run_number }}\` ｜ 触发 \`${{ github.event_name }}\` ｜ 触发者 \`${{ github.actor }}\`"
+            echo ""
+            echo "## 📊 各仓库同步结果"
+            echo ""
+            echo "| 状态 | 源仓库 | 目标仓库 | 检出方式 | 推送 | 分支 | 提交数 | 分支数 | 大小 | 耗时 |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            if [ -n "$ROWS" ]; then
+              echo -e "$ROWS"
+            else
+              echo "| — | — | — | — | — | — | — | — | — | — |"
+            fi
+            echo ""
+            echo "## 🧹 清理旧运行记录"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 保留天数 | ${CLEAN_DAYS:-1} 天 |"
+            echo "| 截止时间 | ${CLEAN_CUTOFF:-—} |"
+            echo "| 待删除总数 | ${CLEAN_TOTAL:-0} |"
+            echo "| ✅ 成功删除 | ${CLEAN_DELETED:-0} |"
+            echo "| ❌ 删除失败 | ${CLEAN_FAILED:-0} |"
+            if [ "${CLEAN_SKIPPED}" = "true" ]; then
+              echo "| ⚠️ 备注 | 未找到目标工作流，已跳过 |"
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "<sub>🤖 由 GitHub Actions 自动生成 ｜ 工作流：\`${{ github.workflow }}\` ｜ 运行：[\`#${{ github.run_number }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>"
+          } >> "$GITHUB_STEP_SUMMARY"
