@@ -139,22 +139,42 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ---------- 3. 记录检出结果 ----------
-      - name: 记录检出结果
+      # ---------- 3. 检查检出是否成功（失败即中止并明确报错） ----------
+      - name: 检查检出结果
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
+          DEFAULT="${{ steps.checkout_default.outcome }}"
+          PRIVATE="${{ steps.checkout_private.outcome }}"
+
           echo "" | tee -a "${LOG}"
           echo "----- 检出结果 -----" | tee -a "${LOG}"
-          if [ "${{ steps.checkout_default.outcome }}" = "success" ]; then
+          echo "默认 GITHUB_TOKEN : ${DEFAULT}" | tee -a "${LOG}"
+          echo "私有 TOKEN        : ${PRIVATE}" | tee -a "${LOG}"
+
+          if [ "${DEFAULT}" = "success" ]; then
             echo "检出方式 : 默认 GITHUB_TOKEN" | tee -a "${LOG}"
-          else
+          elif [ "${PRIVATE}" = "success" ]; then
             echo "检出方式 : 私有仓库 TOKEN (GH_PRIVATE_TOKEN)" | tee -a "${LOG}"
             echo "切换原因 : 默认 GITHUB_TOKEN 无权访问该仓库" | tee -a "${LOG}"
+          else
+            echo "" | tee -a "${LOG}"
+            echo "❌ 两种 Token 均无法访问仓库: ${{ matrix.repo.source }}" | tee -a "${LOG}"
+            echo "可能原因：" | tee -a "${LOG}"
+            echo "  1. 仓库不存在或路径拼写错误" | tee -a "${LOG}"
+            echo "  2. GITHUB_TOKEN 无法跨仓库访问（正常现象）" | tee -a "${LOG}"
+            echo "  3. GH_PRIVATE_TOKEN 未授权访问该私有仓库" | tee -a "${LOG}"
+            echo "      - Classic PAT: 需勾选 repo 权限" | tee -a "${LOG}"
+            echo "      - Fine-grained PAT: 需把该仓库加入可访问列表" | tee -a "${LOG}"
+            exit 1
           fi
+
+      # ---------- 3b. 输出仓库统计信息 ----------
+      - name: 输出仓库统计信息
+        run: |
+          LOG="${RUNNER_TEMP}/sync.log"
           echo "当前分支 : $(git branch --show-current)" | tee -a "${LOG}"
           echo "最新提交 : $(git log -1 --oneline)" | tee -a "${LOG}"
           echo "提交总数 : $(git rev-list --count HEAD)" | tee -a "${LOG}"
-          echo "标签数量 : $(git tag | wc -l)" | tee -a "${LOG}"
           echo "分支数量 : $(git branch -r | wc -l)" | tee -a "${LOG}"
           echo "工作区大小: $(du -sh .git | cut -f1)" | tee -a "${LOG}"
 
