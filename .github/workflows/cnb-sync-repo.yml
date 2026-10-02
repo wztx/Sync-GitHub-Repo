@@ -139,10 +139,27 @@ jobs:
           fi
           echo "✅ Secret 检查通过" | tee -a "${LOG}"
 
-      # ---------- 2. 检出原仓库（默认 GITHUB_TOKEN） ----------
+      # ---------- 2. 预探测默认 TOKEN 是否有权访问源仓库 ----------
+      - name: 探测默认 TOKEN 可访问性
+        id: probe
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LOG="${RUNNER_TEMP}/sync.log"
+          echo "" | tee -a "${LOG}"
+          echo "----- 探测默认 TOKEN 可访问性 -----" | tee -a "${LOG}"
+          if gh api "repos/${{ matrix.repo.source }}" --silent > /dev/null 2>&1; then
+            echo "✅ 默认 GITHUB_TOKEN 可访问该仓库" | tee -a "${LOG}"
+          else
+            echo "⚠️ 默认 GITHUB_TOKEN 无法访问，将使用私有 TOKEN" | tee -a "${LOG}"
+            exit 1
+          fi
+
+      # ---------- 3. 检出（默认 TOKEN） ----------
       - name: 检出原仓库（默认 GITHUB_TOKEN）
         id: checkout_default
-        continue-on-error: true
+        if: steps.probe.outcome == 'success'
         uses: actions/checkout@v7
         with:
           repository: ${{ matrix.repo.source }}
@@ -150,10 +167,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ---------- 3. 默认 TOKEN 失败时切换私有 TOKEN ----------
-      - name: 默认 TOKEN 失败 → 切换私有仓库 TOKEN
+      # ---------- 4. 检出（私有 TOKEN） ----------
+      - name: 检出原仓库（私有仓库 TOKEN）
         id: checkout_private
-        if: steps.checkout_default.outcome == 'failure'
+        if: steps.probe.outcome == 'failure'
         uses: actions/checkout@v7
         with:
           repository: ${{ matrix.repo.source }}
@@ -161,23 +178,24 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ---------- 4. 检查检出结果（失败即中止并明确报错） ----------
+      # ---------- 5. 检查检出结果 ----------
       - name: 检查检出结果
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
+          PROBE="${{ steps.probe.outcome }}"
           DEFAULT="${{ steps.checkout_default.outcome }}"
           PRIVATE="${{ steps.checkout_private.outcome }}"
 
           echo "" | tee -a "${LOG}"
           echo "----- 检出结果 -----" | tee -a "${LOG}"
-          echo "默认 GITHUB_TOKEN : ${DEFAULT}" | tee -a "${LOG}"
-          echo "私有 TOKEN        : ${PRIVATE}" | tee -a "${LOG}"
+          echo "默认可访问性探测 : ${PROBE}" | tee -a "${LOG}"
+          echo "默认 TOKEN 检出  : ${DEFAULT}" | tee -a "${LOG}"
+          echo "私有 TOKEN 检出  : ${PRIVATE}" | tee -a "${LOG}"
 
           if [ "${DEFAULT}" = "success" ]; then
             echo "检出方式 : 默认 GITHUB_TOKEN" | tee -a "${LOG}"
           elif [ "${PRIVATE}" = "success" ]; then
             echo "检出方式 : 私有仓库 TOKEN (GH_PRIVATE_TOKEN)" | tee -a "${LOG}"
-            echo "切换原因 : 默认 GITHUB_TOKEN 无权访问该仓库" | tee -a "${LOG}"
           else
             echo "" | tee -a "${LOG}"
             echo "❌ 两种 Token 均无法访问仓库: ${{ matrix.repo.source }}" | tee -a "${LOG}"
@@ -193,7 +211,7 @@ jobs:
             exit 1
           fi
 
-      # ---------- 5. 输出仓库统计信息 ----------
+      # ---------- 6. 输出仓库统计信息 ----------
       - name: 输出仓库统计信息
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
@@ -203,7 +221,7 @@ jobs:
           echo "分支数量 : $(git branch -r | wc -l)" | tee -a "${LOG}"
           echo "工作区大小: $(du -sh .git | cut -f1)" | tee -a "${LOG}"
 
-      # ---------- 6. 配置 Git 用户 ----------
+      # ---------- 7. 配置 Git 用户 ----------
       - name: 配置 Git 用户信息
         run: |
           LOG="${RUNNER_TEMP}/sync.log"
@@ -211,7 +229,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           echo "Git 用户已配置: github-actions[bot]" | tee -a "${LOG}"
 
-      # ---------- 7. 同步分支到 CNB.COOL ----------
+      # ---------- 8. 同步分支到 CNB.COOL ----------
       - name: 同步分支到 CNB.COOL
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
@@ -252,7 +270,7 @@ jobs:
 
           echo "完成时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" | tee -a "${LOG}"
 
-      # ---------- 8. 输出日志到工作流页面 ----------
+      # ---------- 9. 输出日志到工作流页面 ----------
       - name: 输出日志至工作流页面
         if: always()
         run: |
@@ -265,6 +283,7 @@ jobs:
             echo ""
             echo "| 项目 | 结果 |"
             echo "|---|---|"
+            echo "| 默认可访问性探测 | ${{ steps.probe.outcome }} |"
             echo "| 默认 TOKEN 检出 | ${{ steps.checkout_default.outcome }} |"
             echo "| 私有 TOKEN 检出 | ${{ steps.checkout_private.outcome }} |"
             echo "| 作业状态 | ${{ job.status }} |"
@@ -282,7 +301,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- 9. 清理缓存与临时文件 ----------
+      # ---------- 10. 清理缓存与临时文件 ----------
       - name: 清理缓存和临时文件
         if: always()
         run: |
