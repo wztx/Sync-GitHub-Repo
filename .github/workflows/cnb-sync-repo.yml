@@ -2,13 +2,95 @@ name: 自动同步到CNB.COOL
 
 on:
   workflow_dispatch:        # 手动触发
+    inputs:
+      days:
+        description: '保留最近多少天的工作流运行记录（更早的将被自动删除）'
+        required: false
+        default: '1'
+        type: string
   schedule:                 # 定时触发（每6小时）
     - cron: '0 */6 * * *'
 
 jobs:
-  sync-to-cnb:
+  # ======================================================
+  # 任务一：清理旧的工作流运行记录（在所有同步之前执行）
+  # ======================================================
+  cleanup-old-runs:
+    name: 清理旧工作流运行记录
     runs-on: ubuntu-latest
+    permissions:
+      actions: write       # 删除工作流运行记录所需权限
+      contents: read
+
+    steps:
+      - name: 删除超过指定天数的工作流运行记录
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          DAYS: ${{ inputs.days || '1' }}
+        run: |
+          echo "==============================================="
+          echo "清理旧工作流运行记录"
+          echo "工作流名称: ${WORKFLOW_NAME}"
+          echo "保留天数  : ${DAYS} 天"
+          echo "开始时间  : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "==============================================="
+
+          # 计算截止时间
+          CUTOFF=$(date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "删除 ${CUTOFF} 之前的运行记录"
+          echo ""
+
+          # 查找当前工作流的 ID
+          WORKFLOW_ID=$(gh api "repos/${REPO}/actions/workflows" --paginate \
+            --jq ".workflows[] | select(.name == \"${WORKFLOW_NAME}\") | .id" | head -1)
+
+          if [ -z "${WORKFLOW_ID}" ]; then
+            echo "⚠️ 未找到工作流: ${WORKFLOW_NAME}，跳过清理"
+            exit 0
+          fi
+          echo "工作流 ID: ${WORKFLOW_ID}"
+          echo ""
+
+          # 列出该工作流中早于截止时间的运行记录
+          RUN_IDS=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs" --paginate \
+            --jq ".workflow_runs[] | select(.created_at < \"${CUTOFF}\") | .id")
+
+          if [ -z "${RUN_IDS}" ]; then
+            echo "✅ 没有需要删除的运行记录"
+            exit 0
+          fi
+
+          DELETED=0
+          FAILED=0
+          TOTAL=$(echo "${RUN_IDS}" | wc -l | tr -d ' ')
+          echo "共找到 ${TOTAL} 条待删除记录"
+          echo ""
+
+          for id in ${RUN_IDS}; do
+            if gh api -X DELETE "repos/${REPO}/actions/runs/${id}" 2>/dev/null; then
+              echo "✅ 已删除运行记录 ID: ${id}"
+              DELETED=$((DELETED + 1))
+            else
+              echo "❌ 删除失败运行记录 ID: ${id}"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          echo ""
+          echo "==============================================="
+          echo "清理完成：成功 ${DELETED} 条 / 失败 ${FAILED} 条 / 总计 ${TOTAL} 条"
+          echo "结束时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "==============================================="
+
+  # ======================================================
+  # 任务二：同步仓库到 CNB.COOL
+  # ======================================================
+  sync-to-cnb:
     name: 同步 ${{ matrix.repo.source }} → ${{ matrix.repo.target }}
+    runs-on: ubuntu-latest
+    needs: cleanup-old-runs      # 清理完成后再同步
 
     # ===== 多仓库配置：从单个 JSON 变量解析为矩阵 =====
     strategy:
@@ -17,28 +99,142 @@ jobs:
         repo: ${{ fromJSON(vars.CNB_SYNC_REPOS) }}
 
     steps:
-      # 1. 检出原仓库代码（使用 actions/checkout@v7）
-      - name: 检出原仓库
+      # ---------- 0. 初始化日志 ----------
+      - name: 输出任务开始信息
+        run: |
+          LOG="${RUNNER_TEMP}/sync.log"
+          {
+            echo "==============================================="
+            echo "任务开始: 自动同步到 CNB.COOL"
+            echo "源仓库  : ${{ matrix.repo.source }}"
+            echo "目标仓库: cnb.cool/${{ matrix.repo.target }}.git"
+            echo "触发事件: ${{ github.event_name }}"
+            echo "触发者  : ${{ github.actor }}"
+            echo "运行编号: ${{ github.run_number }}"
+            echo "开始时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "运行环境: $(uname -a)"
+            echo "==============================================="
+          } | tee "${LOG}"
+          echo "日志文件: ${LOG}" | tee -a "${LOG}"
+
+      # ---------- 1. 检出原仓库（优先使用默认 TOKEN） ----------
+      - name: 检出原仓库（默认 GITHUB_TOKEN）
+        id: checkout_default
+        continue-on-error: true      # 失败不中断，后续切换私有 TOKEN
         uses: actions/checkout@v7
         with:
           repository: ${{ matrix.repo.source }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0      # 拉取完整历史，便于 mirror 推送
+          fetch-depth: 0
           persist-credentials: false
 
-      # 2. 配置 Git 用户信息
-      - name: 配置 Git 用户
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      # ---------- 2. 默认 TOKEN 失败时，切换私有仓库 TOKEN ----------
+      - name: 默认 TOKEN 失败 → 切换私有仓库 TOKEN
+        id: checkout_private
+        if: steps.checkout_default.outcome == 'failure'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repo.source }}
+          token: ${{ secrets.GH_PRIVATE_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      # 3. 推送镜像到 CNB.COOL
-      #    CNB 认证方式：用户名固定为 cnb，密码为访问令牌
-      #    target 为 group/repo 简写，这里自动拼接域名与 .git 后缀
+      # ---------- 3. 记录检出结果 ----------
+      - name: 记录检出结果
+        run: |
+          LOG="${RUNNER_TEMP}/sync.log"
+          echo "" | tee -a "${LOG}"
+          echo "----- 检出结果 -----" | tee -a "${LOG}"
+          if [ "${{ steps.checkout_default.outcome }}" = "success" ]; then
+            echo "检出方式 : 默认 GITHUB_TOKEN" | tee -a "${LOG}"
+          else
+            echo "检出方式 : 私有仓库 TOKEN (GH_PRIVATE_TOKEN)" | tee -a "${LOG}"
+            echo "切换原因 : 默认 GITHUB_TOKEN 无权访问该仓库" | tee -a "${LOG}"
+          fi
+          echo "当前分支 : $(git branch --show-current)" | tee -a "${LOG}"
+          echo "最新提交 : $(git log -1 --oneline)" | tee -a "${LOG}"
+          echo "提交总数 : $(git rev-list --count HEAD)" | tee -a "${LOG}"
+          echo "标签数量 : $(git tag | wc -l)" | tee -a "${LOG}"
+          echo "分支数量 : $(git branch -r | wc -l)" | tee -a "${LOG}"
+          echo "工作区大小: $(du -sh .git | cut -f1)" | tee -a "${LOG}"
+
+      # ---------- 4. 配置 Git 用户 ----------
+      - name: 配置 Git 用户信息
+        run: |
+          LOG="${RUNNER_TEMP}/sync.log"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          echo "Git 用户已配置: github-actions[bot]" | tee -a "${LOG}"
+
+      # ---------- 5. 推送到 CNB.COOL ----------
       - name: 同步到 CNB.COOL
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           TARGET_REPO: ${{ matrix.repo.target }}
         run: |
+          set -o pipefail
+          LOG="${RUNNER_TEMP}/sync.log"
+          echo "" | tee -a "${LOG}"
+          echo "----- 开始推送到 CNB.COOL -----" | tee -a "${LOG}"
+          echo "目标地址: https://cnb.cool/${TARGET_REPO}.git" | tee -a "${LOG}"
+          echo "认证用户: cnb" | tee -a "${LOG}"
           git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${TARGET_REPO}.git"
-          git push cnb --mirror
+          echo "执行 git push --mirror ..." | tee -a "${LOG}"
+          if git push cnb --mirror 2>&1 | tee -a "${LOG}"; then
+            echo "✅ 推送成功" | tee -a "${LOG}"
+          else
+            echo "❌ 推送失败" | tee -a "${LOG}"
+            exit 1
+          fi
+          echo "完成时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" | tee -a "${LOG}"
+
+      # ---------- 6. 输出日志到工作流页面（无论成功失败） ----------
+      - name: 输出日志至工作流页面
+        if: always()
+        run: |
+          LOG="${RUNNER_TEMP}/sync.log"
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📋 同步日志：\`${{ matrix.repo.source }}\` → \`${{ matrix.repo.target }}\`"
+            echo ""
+            echo "| 项目 | 结果 |"
+            echo "|---|---|"
+            echo "| 默认 TOKEN 检出 | ${{ steps.checkout_default.outcome }} |"
+            echo "| 私有 TOKEN 检出 | ${{ steps.checkout_private.outcome }} |"
+            echo "| 作业状态 | ${{ job.status }} |"
+            echo ""
+            echo "<details><summary>展开完整日志</summary>"
+            echo ""
+            echo '```text'
+            if [ -f "${LOG}" ]; then
+              cat "${LOG}"
+            else
+              echo "（无日志记录）"
+            fi
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 7. 清理缓存与临时文件（无论成功失败） ----------
+      - name: 清理缓存和临时文件
+        if: always()
+        run: |
+          echo "----- 开始清理 -----"
+          # 移除嵌入了凭证的远程地址
+          git remote remove cnb 2>/dev/null || true
+          echo "已移除远程 cnb"
+          # 清空 Git 全局配置
+          git config --global --unset user.name  2>/dev/null || true
+          git config --global --unset user.email 2>/dev/null || true
+          echo "已清理 Git 全局配置"
+          # 删除日志与临时文件
+          rm -f "${RUNNER_TEMP}/sync.log"
+          rm -rf "${RUNNER_TEMP:?}"/*  2>/dev/null || true
+          echo "已清理临时目录: ${RUNNER_TEMP}"
+          # 清理工作区未跟踪文件（保留 .git）
+          git clean -fdx 2>/dev/null || true
+          echo "已清理工作区"
+          echo "✅ 清理完成"
