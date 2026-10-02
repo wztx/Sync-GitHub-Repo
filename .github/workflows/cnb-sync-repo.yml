@@ -171,6 +171,7 @@ jobs:
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           TARGET_REPO: ${{ matrix.repo.target }}
+          GH_TOKEN: ${{ secrets.GH_PRIVATE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
           LOG="${RUNNER_TEMP}/sync.log"
@@ -179,9 +180,16 @@ jobs:
           echo "目标地址: https://cnb.cool/${TARGET_REPO}.git" | tee -a "${LOG}"
           echo "认证用户: cnb" | tee -a "${LOG}"
 
+          # ===== 构造 GitHub 认证头 =====
+          # actions/checkout 的 persist-credentials: false 不会保存凭证到 .git/config
+          # 因此需要手动为 git fetch 注入 Basic Auth 头
+          GH_AUTH=$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 -w0)
+          GH_HEADER="Authorization: basic ${GH_AUTH}"
+
           # 抓取完整的远程分支引用，确保后续推送覆盖所有分支
           echo ">> 抓取远程分支引用..." | tee -a "${LOG}"
-          git fetch --prune origin "+refs/heads/*:refs/remotes/origin/*" 2>&1 | tee -a "${LOG}"
+          git -c http.extraheader="${GH_HEADER}" \
+            fetch --prune origin "+refs/heads/*:refs/remotes/origin/*" 2>&1 | tee -a "${LOG}"
 
           git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${TARGET_REPO}.git"
 
