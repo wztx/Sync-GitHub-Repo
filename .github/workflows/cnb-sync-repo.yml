@@ -178,14 +178,23 @@ jobs:
           echo "----- 开始推送到 CNB.COOL -----" | tee -a "${LOG}"
           echo "目标地址: https://cnb.cool/${TARGET_REPO}.git" | tee -a "${LOG}"
           echo "认证用户: cnb" | tee -a "${LOG}"
+
+          # 抓取完整的远程分支引用，确保后续推送覆盖所有分支
+          echo ">> 抓取远程分支引用..." | tee -a "${LOG}"
+          git fetch --prune origin "+refs/heads/*:refs/remotes/origin/*" 2>&1 | tee -a "${LOG}"
+
           git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${TARGET_REPO}.git"
-          echo "执行 git push --mirror ..." | tee -a "${LOG}"
-          if git push cnb --mirror 2>&1 | tee -a "${LOG}"; then
-            echo "✅ 推送成功" | tee -a "${LOG}"
+
+          # 推送所有分支（--prune 删除目标端多余分支；不推送标签）
+          echo "" | tee -a "${LOG}"
+          echo ">> 推送所有分支（含 prune 删除多余分支，不推送标签）..." | tee -a "${LOG}"
+          if git push cnb --prune --force --no-tags "refs/remotes/origin/*:refs/heads/*" 2>&1 | tee -a "${LOG}"; then
+            echo "✅ 分支推送成功" | tee -a "${LOG}"
           else
-            echo "❌ 推送失败" | tee -a "${LOG}"
+            echo "❌ 分支推送失败" | tee -a "${LOG}"
             exit 1
           fi
+
           echo "完成时间: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" | tee -a "${LOG}"
 
       # ---------- 6. 输出日志到工作流页面（无论成功失败） ----------
