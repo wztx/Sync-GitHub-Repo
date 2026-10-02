@@ -1,0 +1,44 @@
+name: 自动同步到CNB.COOL
+
+on:
+  workflow_dispatch:        # 手动触发
+  schedule:                 # 定时触发（每6小时）
+    - cron: '0 */6 * * *'
+
+jobs:
+  sync-to-cnb:
+    runs-on: ubuntu-latest
+    name: 同步 ${{ matrix.repo.source }} → ${{ matrix.repo.target }}
+
+    # ===== 多仓库配置：从单个 JSON 变量解析为矩阵 =====
+    strategy:
+      fail-fast: false      # 一个仓库失败不影响其他仓库
+      matrix:
+        repo: ${{ fromJSON(vars.CNB_SYNC_REPOS) }}
+
+    steps:
+      # 1. 检出原仓库代码（使用 actions/checkout@v7）
+      - name: 检出原仓库
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repo.source }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0      # 拉取完整历史，便于 mirror 推送
+          persist-credentials: false
+
+      # 2. 配置 Git 用户信息
+      - name: 配置 Git 用户
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      # 3. 推送镜像到 CNB.COOL
+      #    CNB 认证方式：用户名固定为 cnb，密码为访问令牌
+      #    target 为 group/repo 简写，这里自动拼接域名与 .git 后缀
+      - name: 同步到 CNB.COOL
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          TARGET_REPO: ${{ matrix.repo.target }}
+        run: |
+          git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${TARGET_REPO}.git"
+          git push cnb --mirror
